@@ -1,137 +1,56 @@
 #include <Arduino.h>
-#include "BluetoothSerial.h"
+#include "esp_task_wdt.h"
+
 #include "config.h"
+#include "battery.h"
+#include "scale.h"
+#include "display_mgr.h"
+#include "bt_handler.h"
 
-BluetoothSerial SerialBT;
-
-String btCommand = "";
-float lastWeight = 0.0;
-
-#define LED_HIJAU   18
-#define LED_MERAH   19
-
-String extractNumericPart(String inputString) {
-    String numericPart = "";
-    bool foundNumeric = false;
-    bool foundDecimal = false;
-    bool foundNegative = false;
-
-    inputString.trim();
-
-    for (int i = 0; i < inputString.length(); i++) {
-        char currentChar = inputString.charAt(i);
-
-        if (isdigit(currentChar)) {
-            numericPart += currentChar;
-            foundNumeric = true;
-        } else if (currentChar == '.' && !foundDecimal && foundNumeric) {
-            numericPart += currentChar;
-            foundDecimal = true;
-        } else if (currentChar == '-' && !foundNumeric && !foundNegative) {
-            numericPart += currentChar;
-            foundNegative = true;
-        } else if (foundNumeric) {
-            break;
-        }
-    }
-
-    return numericPart;
-}
-
-float readWeight() {
-    static String buffer = "";
-
-    while (rs232Serial.available()) {
-        char c = rs232Serial.read();
-
-        if (c == '\n') {
-            String numericPart = extractNumericPart(buffer);
-            buffer = "";
-
-            if (numericPart.length() > 0) {
-                lastWeight = numericPart.toFloat();
-                Serial.println("UPDATE: " + String(lastWeight));
-            }
-        } 
-        else if (buffer.length() < 30) {
-            buffer += c;
-        } 
-        else {
-            buffer = "";
-        }
-    }
-
-    return lastWeight;
-}
-
-void setBluetoothStatus(bool connected) {
-    if (connected) {
-        digitalWrite(LED_MERAH, LOW);
-        digitalWrite(LED_HIJAU, HIGH);
-        Serial.println("Bluetooth: TERHUBUNG - LED Hijau ON");
-    } else {
-        digitalWrite(LED_HIJAU, LOW);
-        digitalWrite(LED_MERAH, HIGH);
-        Serial.println("Bluetooth: MENUNGGU - LED Merah ON");
-    }
-}
+// =============================================================
+//  ScaleReader v2 — Production Firmware
+//  Hardware : ESP32 + 2× Samsung 18650 parallel + BMS + 5V booster
+//  Display  : SSD1306 OLED 128×64
+//  Weight   : RS232 scale via MAX3232 → UART2
+//  Comms    : Bluetooth Classic
+// =============================================================
 
 void setup() {
     Serial.begin(115200);
+    Serial.println("\n=== ScaleReader v2 BOOT ===");
 
+    // --- Watchdog: reboot if loop stalls for WDT_TIMEOUT_S seconds ---
+    esp_task_wdt_init(WDT_TIMEOUT_S, true);
+    esp_task_wdt_add(NULL);
+
+    // --- GPIO ---
     pinMode(LED_HIJAU, OUTPUT);
     pinMode(LED_MERAH, OUTPUT);
-    
-    setBluetoothStatus(false);
+    digitalWrite(LED_HIJAU, LOW);
+    digitalWrite(LED_MERAH, HIGH);   // red = waiting
 
-    rs232Serial.begin(9600, SERIAL_8N1, WEIGHT_RX_PIN, -1);
+    // --- Subsystems ---
+    battery_init();
+    scale_init();
+    display_init();
+    bt_init();
 
-    SerialBT.begin("ScaleReader");
-    
-    if (SerialBT.hasClient()) {
-        setBluetoothStatus(true);
-    }
-
-    Serial.println("Ready bro, kirim GET_WEIGHT");
+    Serial.println("[READY] Send GET_WEIGHT via BT to query weight");
 }
 
 void loop() {
-    readWeight();
+    esp_task_wdt_reset();   // feed watchdog
 
-    static bool lastConnectionStatus = false;
-    bool currentConnectionStatus = SerialBT.hasClient();
-    
-    if (currentConnectionStatus != lastConnectionStatus) {
-        setBluetoothStatus(currentConnectionStatus);
-        lastConnectionStatus = currentConnectionStatus;
+    scale_tick();           // read RS232 bytes (non-blocking)
+    bt_tick();              // handle BT commands + detect connect/disconnect
+
+    // Battery: one ADC sample per tick; result ready after ADC_SAMPLES ticks
+    if (battery_tick()) {
+        display_set_battery(battery_get_percent());
     }
 
-    while (SerialBT.available()) {
-        char c = SerialBT.read();
+    // Push latest weight to display state every loop
+    display_set_weight(scale_get_weight());
 
-        if (c == '\n') {
-            btCommand.trim();
-
-            Serial.println("CMD: " + btCommand);
-
-            if (btCommand == "GET_WEIGHT") {
-                String response;
-
-                if (isnan(lastWeight) || lastWeight == 0.0) {
-                    response = "NO_DATA";
-                } else {
-                    response = String(lastWeight, 2) + " kg";
-                }
-
-                SerialBT.println(response);
-                Serial.println("SEND: " + response);
-            }
-
-            btCommand = "";
-        } else {
-            btCommand += c;
-        }
-    }
-
-    delay(10);
+    display_tick();         // refresh OLED (throttled to 200 ms)
 }
